@@ -56,6 +56,7 @@ type AdminService interface {
 	GetAllProxies(ctx context.Context) ([]Proxy, error)
 	GetAllProxiesWithAccountCount(ctx context.Context) ([]ProxyWithAccountCount, error)
 	GetProxy(ctx context.Context, id int64) (*Proxy, error)
+	GetProxiesByIDs(ctx context.Context, ids []int64) ([]Proxy, error)
 	CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error)
 	UpdateProxy(ctx context.Context, id int64, input *UpdateProxyInput) (*Proxy, error)
 	DeleteProxy(ctx context.Context, id int64) error
@@ -93,6 +94,9 @@ type UpdateUserInput struct {
 	Concurrency   *int     // 使用指针区分"未提供"和"设置为0"
 	Status        string
 	AllowedGroups *[]int64 // 使用指针区分"未提供"和"设置为空数组"
+	// GroupRates 用户专属分组倍率配置
+	// map[groupID]*rate，nil 表示删除该分组的专属倍率
+	GroupRates map[int64]*float64
 }
 
 type CreateGroupInput struct {
@@ -166,6 +170,8 @@ type CreateAccountInput struct {
 	GroupIDs           []int64
 	ExpiresAt          *int64
 	AutoPauseOnExpired *bool
+	// SkipDefaultGroupBind prevents auto-binding to platform default group when GroupIDs is empty.
+	SkipDefaultGroupBind bool
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
 	// This should only be set when the caller has explicitly confirmed the risk.
 	SkipMixedChannelCheck bool
@@ -293,6 +299,7 @@ type adminServiceImpl struct {
 	proxyRepo            ProxyRepository
 	apiKeyRepo           APIKeyRepository
 	redeemCodeRepo       RedeemCodeRepository
+	userGroupRateRepo    UserGroupRateRepository
 	billingCacheService  *BillingCacheService
 	proxyProber          ProxyExitInfoProber
 	proxyLatencyCache    ProxyLatencyCache
@@ -307,6 +314,7 @@ func NewAdminService(
 	proxyRepo ProxyRepository,
 	apiKeyRepo APIKeyRepository,
 	redeemCodeRepo RedeemCodeRepository,
+	userGroupRateRepo UserGroupRateRepository,
 	billingCacheService *BillingCacheService,
 	proxyProber ProxyExitInfoProber,
 	proxyLatencyCache ProxyLatencyCache,
@@ -319,6 +327,7 @@ func NewAdminService(
 		proxyRepo:            proxyRepo,
 		apiKeyRepo:           apiKeyRepo,
 		redeemCodeRepo:       redeemCodeRepo,
+		userGroupRateRepo:    userGroupRateRepo,
 		billingCacheService:  billingCacheService,
 		proxyProber:          proxyProber,
 		proxyLatencyCache:    proxyLatencyCache,
@@ -333,11 +342,35 @@ func (s *adminServiceImpl) ListUsers(ctx context.Context, page, pageSize int, fi
 	if err != nil {
 		return nil, 0, err
 	}
+	// 批量加载用户专属分组倍率
+	if s.userGroupRateRepo != nil && len(users) > 0 {
+		for i := range users {
+			rates, err := s.userGroupRateRepo.GetByUserID(ctx, users[i].ID)
+			if err != nil {
+				log.Printf("failed to load user group rates: user_id=%d err=%v", users[i].ID, err)
+				continue
+			}
+			users[i].GroupRates = rates
+		}
+	}
 	return users, result.Total, nil
 }
 
 func (s *adminServiceImpl) GetUser(ctx context.Context, id int64) (*User, error) {
-	return s.userRepo.GetByID(ctx, id)
+	user, err := s.userRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// 加载用户专属分组倍率
+	if s.userGroupRateRepo != nil {
+		rates, err := s.userGroupRateRepo.GetByUserID(ctx, id)
+		if err != nil {
+			log.Printf("failed to load user group rates: user_id=%d err=%v", id, err)
+		} else {
+			user.GroupRates = rates
+		}
+	}
+	return user, nil
 }
 
 func (s *adminServiceImpl) CreateUser(ctx context.Context, input *CreateUserInput) (*User, error) {
@@ -406,6 +439,14 @@ func (s *adminServiceImpl) UpdateUser(ctx context.Context, id int64, input *Upda
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return nil, err
 	}
+
+	// 同步用户专属分组倍率
+	if input.GroupRates != nil && s.userGroupRateRepo != nil {
+		if err := s.userGroupRateRepo.SyncUserGroupRates(ctx, user.ID, input.GroupRates); err != nil {
+			log.Printf("failed to sync user group rates: user_id=%d err=%v", user.ID, err)
+		}
+	}
+
 	if s.authCacheInvalidator != nil {
 		if user.Concurrency != oldConcurrency || user.Status != oldStatus || user.Role != oldRole {
 			s.authCacheInvalidator.InvalidateAuthCacheByUserID(ctx, user.ID)
@@ -941,6 +982,7 @@ func (s *adminServiceImpl) DeleteGroup(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	// 注意：user_group_rate_multipliers 表通过外键 ON DELETE CASCADE 自动清理
 
 	// 事务成功后，异步失效受影响用户的订阅缓存
 	if len(affectedUserIDs) > 0 && s.billingCacheService != nil {
@@ -1004,7 +1046,7 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	// 绑定分组
 	groupIDs := input.GroupIDs
 	// 如果没有指定分组,自动绑定对应平台的默认分组
-	if len(groupIDs) == 0 {
+	if len(groupIDs) == 0 && !input.SkipDefaultGroupBind {
 		defaultGroupName := input.Platform + "-default"
 		groups, err := s.groupRepo.ListActiveByPlatform(ctx, input.Platform)
 		if err == nil {
@@ -1342,6 +1384,10 @@ func (s *adminServiceImpl) GetAllProxiesWithAccountCount(ctx context.Context) ([
 
 func (s *adminServiceImpl) GetProxy(ctx context.Context, id int64) (*Proxy, error) {
 	return s.proxyRepo.GetByID(ctx, id)
+}
+
+func (s *adminServiceImpl) GetProxiesByIDs(ctx context.Context, ids []int64) ([]Proxy, error) {
+	return s.proxyRepo.ListByIDs(ctx, ids)
 }
 
 func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error) {
